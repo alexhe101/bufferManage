@@ -55,6 +55,10 @@ func (d *DiskManager) ReadPage(pageId common.PageId, pageData []byte) {
 	} else {
 		d.file.Seek(offset, 0)
 		readCount, err := d.file.Read(pageData)
+		if readCount == 0 {
+			log.Println("EOF while read")
+			return
+		}
 		if err != nil {
 			log.Fatal("error while read")
 		}
