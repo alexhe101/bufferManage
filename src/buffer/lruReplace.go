@@ -11,6 +11,10 @@ type LruReplacer struct {
 	hash     map[common.FrameId]*list.Element
 }
 
+func NewLruReplacer(cap uint) *LruReplacer {
+	return &LruReplacer{cap: cap}
+}
+
 func (l *LruReplacer) Victim() (frameId common.FrameId, err error) {
 	//TODO implement me
 	panic("implement me")
