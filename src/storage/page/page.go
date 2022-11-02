@@ -17,7 +17,7 @@ func (p *Page) IsDirty() bool {
 	return p.isDirty
 }
 
-func (p *Page) Setdirty(isDirty bool) {
+func (p *Page) SetDirty(isDirty bool) {
 	p.isDirty = isDirty
 }
 
@@ -50,4 +50,12 @@ func NewPage() *Page {
 	t.data = make([]byte, common.PAGESIZE)
 	t.pageId = common.INVALIDPAGEID
 	return t
+}
+
+func (p *Page) IncPinCount() {
+	p.pinCount += 1
+}
+
+func (p *Page) DecPinCount() {
+	p.pinCount -= 1
 }
