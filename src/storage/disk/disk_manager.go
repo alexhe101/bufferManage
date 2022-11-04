@@ -13,6 +13,10 @@ type DiskManager struct {
 	latch    sync.Mutex
 }
 
+func (d *DiskManager) Fd() uintptr {
+	return d.file.Fd()
+}
+
 func (d *DiskManager) getFileSize() int64 {
 
 	f, err := d.file.Stat()
@@ -72,4 +76,9 @@ func (d *DiskManager) ShutDown() {
 	d.latch.Lock()
 	defer d.latch.Unlock()
 	d.file.Close()
+}
+
+func (d *DiskManager) Open() {
+	d.latch.Lock()
+	defer d.latch.Unlock()
 }

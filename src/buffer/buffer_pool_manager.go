@@ -4,140 +4,207 @@ import (
 	"bufferManage/src/common"
 	"bufferManage/src/storage/disk"
 	storage "bufferManage/src/storage/page"
-	"container/list"
+	"bytes"
+	"encoding/binary"
+	"reflect"
 	"sync"
-	"sync/atomic"
+	"unsafe"
 )
 
 type BufferPoolManagerInstance struct {
-	poolSize    uint
 	diskManager *disk.DiskManager
-	pages       []*storage.Page
-	pageTable   map[common.PageId]common.FrameId
-	replacer    Replacer
-	freeList    list.List
+	buffer      *MemPool
+	header      *HeapHeader
 	latch       sync.Mutex
-	nextPageID  int64
 }
 
-// PoolSize 返回bufferpool的大小
-func (b *BufferPoolManagerInstance) PoolSize() uint {
-	return b.poolSize
+func (b *BufferPoolManagerInstance) Header() *HeapHeader {
+	return b.header
 }
 
 // Pages 返回缓冲区
 func (b *BufferPoolManagerInstance) Pages() []*storage.Page {
-	return b.pages
+	return b.buffer.pages
 }
 
-func NewBufferPoolManagerInstance(poolSize uint, diskManager *disk.DiskManager) *BufferPoolManagerInstance {
+func NewBufferPoolManagerInstance(memPool *MemPool, diskManager *disk.DiskManager) *BufferPoolManagerInstance {
 	var t BufferPoolManagerInstance
-	t.poolSize = poolSize
 	t.diskManager = diskManager
-	t.pages = make([]*storage.Page, poolSize)
-	for i := 0; uint(i) < poolSize; i++ {
-		t.pages[i] = storage.NewPage()
+	t.buffer = memPool
+	page := t.FetchPage(0)
+	b := page.Data()
+	t.header = (*HeapHeader)(unsafe.Pointer((*reflect.SliceHeader)(unsafe.Pointer(&b)).Data))
+	if t.header.pageCount == 0 {
+		t.header.allocateCount = 1
+		t.header.pageCount = 1
+		t.header.SetAllocated(0)
 	}
-	for i := uint(0); i < poolSize; i++ {
-		t.freeList.PushBack(i)
-	}
-	t.replacer = NewLruReplacer(poolSize)
 	return &t
-}
-
-// GetFreeIndex 找出空闲的index 若不存在 则返回nil
-func (b *BufferPoolManagerInstance) GetFreeIndex() (frameID common.FrameId, err error) {
-	idx := b.freeList.Front()
-	b.freeList.Remove(idx)
-	if idx != nil {
-		return idx.Value.(common.FrameId), nil
-	}
-	return b.replacer.Victim()
 }
 
 // FetchPage 返回空闲的bucket 可用来装入一个硬盘页
 func (b *BufferPoolManagerInstance) FetchPage(id common.PageId) *storage.Page {
 	b.latch.Lock()
 	defer b.latch.Unlock()
-	frameID, ok := b.pageTable[id]
+	fd := b.diskManager.Fd()
+	info := PageInfo{id, fd}
+
+	//如果这一页没牺牲，或是没有被delete，则还能继续用，直接从lru里拿出来
+	//如果在lru里 刚好被淘汰了怎么办？
+	//把fetch这一步也移动到memory manager去
+	//有disk manager 不好移动进去
+	frameID, ok := b.buffer.pagetable[info]
+
 	if ok {
-		b.pages[frameID].IncPinCount()
-		b.replacer.Pin(frameID)
-		return b.pages[frameID]
+		page := b.buffer.FetchPage(frameID)
+		page.IncPinCount()
+		b.buffer.Pin(frameID)
+		return page
 	}
-	frameID, err := b.GetFreeIndex()
-	if err != nil {
-		if b.pages[frameID].IsDirty() {
-			b.diskManager.WritePage(b.pages[frameID].PageId(), b.pages[frameID].Data())
+
+	//如果已经被替换 或被删除 则获取一个新页
+	frameID, err := b.buffer.GetFreeIndex()
+
+	if err == nil {
+		b.buffer.Pin(frameID)
+		page := b.buffer.FetchPage(frameID)
+		//被淘汰的时候 判断是否dirty 若是则写入
+		if page.IsDirty() {
+			b.diskManager.WritePage(page.PageId(), page.Data())
 		}
-		b.pages[frameID].ResetMemory()
-		b.pages[frameID].IncPinCount()
-		b.pages[frameID].SetPageId(id)
-		b.pages[frameID].SetDirty(false)
-		b.pageTable[id] = frameID
-		return b.pages[frameID]
+		page.ResetMemory()
+		b.diskManager.ReadPage(id, page.Data())
+		page.SetPinCount(1)
+		page.SetPageId(id)
+		page.SetDirty(false)
+		b.buffer.SetInfo(info, frameID)
+		return page
 	}
 	return nil
 }
 
 //表明一个页暂时不使用
-func (b *BufferPoolManagerInstance) UnPinPage(id common.PageId, isDirty bool) {
+func (b *BufferPoolManagerInstance) UnPinPage(id common.PageId, isDirty bool) bool {
 	b.latch.Lock()
 	defer b.latch.Unlock()
-	frameID, ok := b.pageTable[id]
+	fd := b.diskManager.Fd()
+	info := PageInfo{id, fd}
+
+	frameID, ok := b.buffer.pagetable[info]
+	//已经被删了或是被替换了
 	if !ok {
-		return
+		return false
 	}
 
-	if b.pages[frameID].PinCount() <= 0 {
-		return
+	page := b.buffer.FetchPage(frameID)
+
+	//已经早已unpin 但是还没被替换或删除
+	if page.PinCount() <= 0 {
+		return false
 	}
-	b.pages[frameID].DecPinCount()
-	b.pages[frameID].SetDirty(isDirty)
-	if b.pages[frameID].PinCount() == 0 {
-		b.replacer.Unpin(frameID)
+
+	//正常情况
+	page.DecPinCount()
+	if isDirty {
+		page.SetDirty(isDirty)
 	}
+	if page.PinCount() == 0 {
+		//扔到lrucache里 但保存在pagetable中
+		b.buffer.Unpin(frameID)
+	}
+
+	return true
+
 }
 
 func (b *BufferPoolManagerInstance) FlushPage(id common.PageId) {
 	b.latch.Lock()
 	defer b.latch.Unlock()
+	fd := b.diskManager.Fd()
+	info := PageInfo{id, fd}
+	frameId := b.buffer.pagetable[info]
 
-	frameId := b.pageTable[id]
-	b.diskManager.WritePage(id, b.pages[frameId].Data())
-	b.pages[frameId].SetDirty(false)
+	b.diskManager.WritePage(id, b.buffer.pages[frameId].Data())
+	b.buffer.pages[frameId].SetDirty(false)
 }
 
 func (b *BufferPoolManagerInstance) FlushAllPage() {
-	for pageId, frameId := range b.pageTable {
-		if b.pages[frameId].IsDirty() {
-			b.FlushPage(pageId)
+	for info, frameId := range b.buffer.pagetable {
+		if info.fd == b.diskManager.Fd() {
+			if b.buffer.pages[frameId].IsDirty() {
+				b.FlushPage(info.id)
+			}
 		}
 	}
+	buf := bytes.Buffer{}
+	binary.Write(&buf, binary.LittleEndian, *b.header)
+	b.diskManager.WritePage(0, buf.Bytes())
 }
 
+// CreateNewPage 0.   Make sure you call AllocatePage!
+// 1.   If all the pages in the buffer pool are pinned, return nullptr.
+// 2.   Pick a victim page P from either the free list or the replacer. Always pick from the free list first.
+// 3.   Update P's metadata, zero out memory and add P to the page table.
+// 4.   Set the page ID output parameter. Return a pointer to P.
 func (b *BufferPoolManagerInstance) CreateNewPage() *storage.Page {
 	b.latch.Lock()
 	defer b.latch.Unlock()
-	frameID, err := b.GetFreeIndex()
+	if b.header.allocateCount >= common.MAXPAGE {
+		return nil
+	}
+
+	//如果没有空闲区
+	frameID, err := b.buffer.GetFreeIndex()
 	if err != nil {
 		return nil
 	}
-	if b.pages[frameID].IsDirty() {
-		b.diskManager.WritePage(b.pages[frameID].PageId(), b.pages[frameID].Data())
+	//并发问题:双方同时得到同一个frameid
+	//a调用pin 失败，b调用pin成功
+	//此时a再次调用pin
+	//导致两者共享相同的frameid
+
+	//不成立 因为getfreeindex时，已经把frameid从对应空闲区中删除了
+
+	b.buffer.Pin(frameID)
+	page := b.buffer.FetchPage(frameID)
+	if page.IsDirty() {
+		b.diskManager.WritePage(page.PageId(), page.Data())
 	}
-	b.pages[frameID].ResetMemory()
-	b.pages[frameID].SetDirty(false)
+	page.ResetMemory()
+	page.SetDirty(false)
 	id := b.allocatePage()
-	b.pages[frameID].SetPageId(id)
-	b.pageTable[id] = frameID
-	b.replacer.Pin(frameID)
-	b.pages[frameID].IncPinCount()
-	return b.pages[frameID]
+	page.SetPageId(id)
+	fd := b.diskManager.Fd()
+	info := PageInfo{id, fd}
+	b.buffer.SetInfo(info, frameID)
+	page.SetPinCount(1)
+	return b.buffer.pages[frameID]
 }
 
 func (b *BufferPoolManagerInstance) allocatePage() common.PageId {
-	ret := b.nextPageID
-	atomic.AddInt64(&b.nextPageID, 1)
-	return common.PageId(ret)
+	return b.header.AllocateNewPage()
+}
+
+func (b *BufferPoolManagerInstance) deallocatePage(id common.PageId) {
+	b.header.DeallocatePage(id)
+}
+
+func (b *BufferPoolManagerInstance) DeletePage(id common.PageId) {
+	b.latch.Lock()
+	defer b.latch.Unlock()
+	fd := b.diskManager.Fd()
+	info := PageInfo{id, fd}
+	frameID, ok := b.buffer.pagetable[info]
+	//早已被换出或是删除
+	if ok == false {
+		b.deallocatePage(id)
+		return
+	}
+	page := b.buffer.FetchPage(frameID)
+	if page.PinCount() > 0 {
+		return
+	}
+
+	b.deallocatePage(id)
+	b.buffer.DeletePage(info, frameID)
 }
